@@ -35,7 +35,7 @@ Log file location: /u01/app/oracle/product/19c/dbhome_1/cfgtoollogs/opatch/opatc
 OPatch failed with error code 73
 ```
 
-### Resolução( O ID está entre colchetes na linha 21)
+### Resolução( O ID está entre colchetes na linha 30)
 ```bash
 opatch rollback -id 27605010
 ```
