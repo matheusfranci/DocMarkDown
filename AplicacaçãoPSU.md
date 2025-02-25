@@ -127,7 +127,7 @@ $ORACLE_HOME/OPatch/opatch apply -local -silent $INSTALL_19C/$DBRU
 $INSTALL_19C/$OCW/custom/scripts/postpatch.sh
 ```
 
-### Aplicação do patch OJVM(Usuário oracke)
+### Aplicação do patch OJVM(Usuário oracle)
 ```bash
 cd /install/oracle/psu/janeiro/37262208/$OJVM
 opatch apply -local -silent
