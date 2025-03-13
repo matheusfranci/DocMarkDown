@@ -1,0 +1,261 @@
+--
+-- the actual commands are listed in BOLD
+-- the next steps use <the new DST version number> in the statements
+-- simply replace it with the actual number ( 11, 15 etc)
+-- of the RDBMS DST version you want to update to.
+
+conn / as sysdba
+shutdown immediate;
+startup upgrade;
+set serveroutput on
+
+-- in a PDB startup upgrade will not work
+-- alter pluggable database open upgrade need to be used
+-- ALTER pluggable DATABASE CLOSE immediate;
+-- ALTER pluggable DATABASE OPEN upgrade;
+
+--
+-- check if previous prepare window is ended
+
+SELECT PROPERTY_NAME, SUBSTR(property_value, 1, 30) value
+FROM DATABASE_PROPERTIES
+WHERE PROPERTY_NAME LIKE 'DST_%'
+ORDER BY PROPERTY_NAME;
+
+--
+-- output should be
+-- PROPERTY_NAME VALUE
+-- ---------------------------- ------------------------------
+-- DST_PRIMARY_TT_VERSION <the old DST version number>
+-- DST_SECONDARY_TT_VERSION 0
+-- DST_UPGRADE_STATE NONE
+--
+--
+-- If DST_UPGRADE_STATE is "PREPARE" then you did not ended the prepare window in step 3)
+--
+-- If there are objects containing TSTZ data in recycle bin,
+-- please purge the bin now.
+-- Otherwise dbms_dst.begin_upgrade will report "ORA-38301: Can not perform DDL/DML over objects in Recycle Bin".
+
+purge dba_recyclebin;
+
+--
+-- clean used tables
+
+TRUNCATE TABLE SYS.DST$TRIGGER_TABLE;
+TRUNCATE TABLE sys.dst$affected_tables;
+TRUNCATE TABLE sys.dst$error_table;
+
+--
+-- Set client_info so one can use:
+-- select .... from V$SESSION where CLIENT_INFO = 'upg_tzv';
+
+EXEC DBMS_APPLICATION_INFO.SET_CLIENT_INFO('upg_tzv')
+
+--
+-- this alter session might speed up DBMS_DST on some db's
+-- see Bug 10209691 / Bug 12658443
+
+alter session set "_with_subquery"=materialize;
+
+--
+-- to avoid the issue in note 1407273.1
+
+alter session set "_simple_view_merging"=TRUE;
+
+--
+-- start upgrade window
+
+EXEC DBMS_DST.BEGIN_UPGRADE(<the new DST version number>);
+
+--
+-- the message
+-- "An upgrade window has been successfully started."
+-- will be seen
+--
+
+--
+-- Sample DBMS_DST.BEGIN_UPGRADE error if a previous (prepare) window was not ended:
+--
+-- SQL> EXEC DBMS_DST.BEGIN_UPGRADE(19);
+-- BEGIN DBMS_DST.BEGIN_UPGRADE(19); END;
+--
+-- *
+-- ERROR at line 1:
+-- ORA-56920: a prepare or upgrade window or an on-demand or datapump-job loading
+-- of a secondary time zone data file is in an active state
+-- ORA-06512: at "SYS.DBMS_SYS_ERROR", line 79
+-- ORA-06512: at "SYS.DBMS_DST", line 1054
+-- ORA-06512: at line 1
+--
+-- FIX: You NEED to end the "PREPARE" window in the previous step BEFORE doing the UPGRADE.
+-- Or in other words, you did not do the "EXEC DBMS_DST.END_PREPARE;" step in point 3)
+--
+--
+-- Sample DBMS_DST.BEGIN_UPGRADE error if the requested DST version / patch is not installed:
+--
+-- SQL> EXEC DBMS_DST.BEGIN_UPGRADE(19);
+-- BEGIN DBMS_DST.BEGIN_UPGRADE(19); END;
+--
+-- *
+-- ERROR at line 1:
+-- ORA-30094: failed to find the time zone data file for version 19 in
+-- $ORACLE_HOME/oracore/zoneinfo
+-- ORA-06512: at "SYS.DBMS_DST", line 57
+-- ORA-06512: at "SYS.DBMS_DST", line 1076
+-- ORA-06512: at line 1
+--
+-- FIX: Install the 12.1.0.x patch for the DST version you want to use. See note 412160.1
+--
+-- Sample DBMS_DST.BEGIN_UPGRADE error if the database is not in upgrade mode:
+--
+-- SQL> EXEC DBMS_DST.BEGIN_UPGRADE(19);
+-- BEGIN DBMS_DST.BEGIN_UPGRADE(19); END;
+--
+-- *
+-- ERROR at line 1:
+-- ORA-56926: database must be in UPGRADE mode in order to start an upgrade windo
+-- ORA-06512: at "SYS.DBMS_SYS_ERROR", line 79
+-- ORA-06512: at "SYS.DBMS_DST", line 1091
+-- ORA-06512: at line 1
+--
+-- FIX: start the database in UPGRADE mode
+--
+
+--
+-- check if this select give no rows, if it does something went wrong
+
+SELECT * FROM sys.dst$error_table;
+
+--  
+-- check if this select
+
+SELECT PROPERTY_NAME, SUBSTR(property_value, 1, 30) value
+FROM DATABASE_PROPERTIES
+WHERE PROPERTY_NAME LIKE 'DST_%'
+ORDER BY PROPERTY_NAME;
+
+--
+-- gives this output:
+-- PROPERTY_NAME VALUE
+-- --------------------------- ------------------------------
+-- DST_PRIMARY_TT_VERSION <the new DST version number>
+-- DST_SECONDARY_TT_VERSION <the old DST version number>
+-- DST_UPGRADE_STATE UPGRADE
+--
+-- Optionally you can check what user tables still need to be updated using DBMS_DST.UPGRADE_DATABASE
+-- BEGIN_UPGRADE upgrades system tables that contain TSTZ data and marks user tables (containing TSTZ data) with the UPGRADE_IN_PROGRESS property.
+-- even if this select gives no rows you still need to do to the rest of the steps
+-- it simply gives an indication of how many user objects need to processed in the later steps
+-- some oracle provided users may be listed here, that is normal
+
+SELECT OWNER, TABLE_NAME, UPGRADE_IN_PROGRESS FROM ALL_TSTZ_TABLES where UPGRADE_IN_PROGRESS='YES';
+
+--
+-- now restart the database - this will also work fine in a PDB
+-- NOTE: Oracle support has seen SR's where some customers stop here, the upgrade is NOT finished yet - please DO follow the next steps !!!!!
+
+shutdown immediate
+startup
+
+-- at this point the database can actually be used note however that the
+-- upgrade_database will take exclusive locks on the tables when they are actually upgraded
+-- so it might provoke issues.
+
+alter session set "_with_subquery"=materialize;
+alter session set "_simple_view_merging"=TRUE;
+
+--
+-- now upgrade the tables who need action
+
+set serveroutput on
+VAR numfail number
+BEGIN
+DBMS_DST.UPGRADE_DATABASE(:numfail,
+parallel => TRUE,
+log_errors => TRUE,
+log_errors_table => 'SYS.DST$ERROR_TABLE',
+log_triggers_table => 'SYS.DST$TRIGGER_TABLE',
+error_on_overlap_time => FALSE,
+error_on_nonexisting_time => FALSE);
+DBMS_OUTPUT.PUT_LINE('Failures:'|| :numfail);
+END;
+/
+
+--
+-- ouput of this will be a list of tables like:
+--
+-- Table list: "APEX_040200"."WWV_FLOW_FEEDBACK_FOLLOWUP"
+-- Number of failures: 0
+-- Table list: "APEX_040200"."WWV_FLOW_FEEDBACK"
+-- Number of failures: 0
+-- Table list: "APEX_040200"."WWV_FLOW_WORKSHEET_NOTIFY"
+-- Number of failures: 0
+-- Table list: "APEX_040200"."WWV_FLOW_DEBUG_MESSAGES2"
+-- Number of failures: 0
+-- Table list: "APEX_040200"."WWV_FLOW_DEBUG_MESSAGES"
+-- Number of failures: 0
+-- Table list: "GSMADMIN_INTERNAL"."AQ$_CHANGE_LOG_QUEUE_TABLE_S"
+-- Number of failures: 0
+-- Table list: "GSMADMIN_INTERNAL"."AQ$_CHANGE_LOG_QUEUE_TABLE_L"
+-- Number of failures: 0
+-- Failures:0
+--
+
+--
+-- this select should , if no errors where given also give "no rows", if it does something went wrong
+
+SELECT * FROM sys.dst$error_table;
+
+--
+-- if there where no failures then end the upgrade.
+
+VAR fail number
+BEGIN
+DBMS_DST.END_UPGRADE(:fail);
+DBMS_OUTPUT.PUT_LINE('Failures:'|| :fail);
+END;
+/
+--
+-- output that will be seen:
+-- An upgrade window has been successfully ended.
+-- Failures:0
+--
+
+--
+-- Sample DBMS_DST.END_UPGRADE error if DBMS_DST.UPGRADE_DATABASE was not issued:
+-- *
+-- ERROR at line 1:
+-- ORA-56929: Ending an upgrade window failed
+-- ORA-06512: at "SYS.DBMS_SYS_ERROR", line 79
+-- ORA-06512: at "SYS.DBMS_DST", line 1169
+-- ORA-06512: at line 2
+--
+-- FIX: start database normally and run DBMS_DST.UPGRADE_DATABASE 
+--
+
+--
+-- last checks
+
+SELECT PROPERTY_NAME, SUBSTR(property_value, 1, 30) value
+FROM DATABASE_PROPERTIES
+WHERE PROPERTY_NAME LIKE 'DST_%'
+ORDER BY PROPERTY_NAME;
+
+--
+-- needed output:
+-- PROPERTY_NAME VALUE
+-- ---------------------------- ------------------------------
+-- DST_PRIMARY_TT_VERSION <the new DST version number>
+-- DST_SECONDARY_TT_VERSION 0
+-- DST_UPGRADE_STATE NONE
+--
+
+SELECT * FROM v$timezone_file;
+
+--
+-- needed output:
+-- FILENAME VERSION
+-- ------------------ ----------
+-- timezlrg_<new version>.dat <new version>
+--
